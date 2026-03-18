@@ -1,0 +1,51 @@
+# macOS / editor
+.DS_Store
+.vscode/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments / Python tooling
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and local run outputs
+*.log
+runs/
+outputs/
+checkpoints/
+artifacts/
+
+# Project-specific generated data and results
+results/
+data/libero/data/
+data/libero/videos/
+
+# Keep lightweight docs/metadata in data tree
+!data/libero/README.md
+!data/libero/meta/
+
+# Model binaries and checkpoints
+models/**/*.safetensors
+models/**/checkpoint*/
+
+# Vendored external package local build artifacts
+external/lerobot/src/lerobot.egg-info/
