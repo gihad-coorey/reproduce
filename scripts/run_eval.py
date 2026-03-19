@@ -8,34 +8,18 @@ from tqdm import tqdm
 
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs import libero as libero_module
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.scripts.lerobot_eval import eval_one
 
 
 TASK_FILE = "configs/tasks.json"
-DATA_PATH = "data/libero"
-DEFAULT_MODEL_PATH = "models/smolvla"
-DEFAULT_RESULT_PATH = "results/baseline_results.json"
+OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
+DEFAULT_RESULT_PATH = "results/official_eval_results.json"
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 EPISODES_PER_TASK = 20
-
-
-def patch_libero_action_dim():
-	original_step = libero_module.LiberoEnv.step
-
-	def patched_step(self, action):
-		action_np = np.asarray(action)
-		if action_np.ndim == 1 and action_np.shape[0] == 6:
-			action_np = np.concatenate([action_np, np.array([0.0], dtype=action_np.dtype)])
-		elif action_np.ndim == 2 and action_np.shape[1] == 6:
-			zeros = np.zeros((action_np.shape[0], 1), dtype=action_np.dtype)
-			action_np = np.concatenate([action_np, zeros], axis=1)
-		return original_step(self, action_np)
-
-	libero_module.LiberoEnv.step = patched_step
+SMOKE_EPISODES = 1
 
 
 def parse_task_name(task_name):
@@ -71,7 +55,7 @@ def build_rename_map(model):
 	return rename_map
 
 
-def run_task(model, preprocessor, postprocessor, task_name, debug=False, debug_steps=5):
+def run_task(model, preprocessor, postprocessor, task_name):
 	suite_name, task_id = parse_task_name(task_name)
 
 	env_cfg = LiberoEnvConfig(task=suite_name, task_ids=[task_id], control_mode="relative")
@@ -79,9 +63,6 @@ def run_task(model, preprocessor, postprocessor, task_name, debug=False, debug_s
 	env = envs[suite_name][task_id]
 
 	env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=model.config)
-
-	if debug:
-		print(f"  [DEBUG] {task_name}: Model image keys={set(model.config.image_features.keys())}")
 
 	metrics = eval_one(
 		env,
@@ -103,23 +84,25 @@ def run_task(model, preprocessor, postprocessor, task_name, debug=False, debug_s
 
 
 def parse_args():
-	parser = argparse.ArgumentParser(description="Run SmolVLA LIBERO evaluation")
-	parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Path to local SmolVLA checkpoint")
-	parser.add_argument("--result-path", default=DEFAULT_RESULT_PATH, help="Path to write JSON results")
-	parser.add_argument("--debug", action="store_true", help="Print per-task debug info (first N steps)")
-	parser.add_argument("--debug-steps", type=int, default=5, help="Number of steps to debug per task")
-	parser.add_argument("--smoke", action="store_true", help="Run only first task with fewer episodes (smoke test)")
-	parser.add_argument("--smoke-episodes", type=int, default=3, help="Episodes for smoke test")
+	parser = argparse.ArgumentParser(
+		description="Run SmolVLA LIBERO evaluation from the terminal.",
+		epilog=(
+			"Examples:\n"
+			"  python scripts/run_eval.py\n"
+			"  python scripts/run_eval.py --smoke"
+		),
+		formatter_class=argparse.RawTextHelpFormatter,
+	)
+	parser.add_argument("--smoke", action="store_true", help="Run only first task with fewer episodes")
 	return parser.parse_args()
 
 
 def main():
 	args = parse_args()
-	model_path = args.model_path
-	result_path = args.result_path
+	model_path = OFFICIAL_MODEL_ID
+	result_path = DEFAULT_RESULT_PATH
 
 	os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-	patch_libero_action_dim()
 
 	with open(TASK_FILE) as f:
 		tasks = json.load(f)
@@ -127,18 +110,13 @@ def main():
 	# If smoke test, only run first task
 	if args.smoke:
 		tasks = tasks[:1]
-		episodes_per_task = args.smoke_episodes
+		episodes_per_task = SMOKE_EPISODES
 		print(f"🔥 SMOKE TEST MODE: Running {len(tasks)} task(s) with {episodes_per_task} episodes each")
 	else:
 		episodes_per_task = EPISODES_PER_TASK
 
 	model = load_model(model_path)
 	rename_map = build_rename_map(model)
-	
-	if args.debug:
-		print(f"\n[DEBUG MODE] Rename map: {rename_map}")
-		print(f"[DEBUG MODE] Model input features: {sorted(model.config.input_features.keys())}")
-		print(f"[DEBUG MODE] Model image features: {sorted(model.config.image_features.keys())}\n")
 	
 	preprocessor, postprocessor = make_pre_post_processors(
 		policy_cfg=model.config,
@@ -159,7 +137,7 @@ def main():
 
 	for task in tqdm(tasks, desc="Tasks"):
 		print("Running task:", task)
-		sr = run_task(model, preprocessor, postprocessor, task, debug=args.debug, debug_steps=args.debug_steps)
+		sr = run_task(model, preprocessor, postprocessor, task)
 		results[task] = float(sr)
 
 	# Restore original
