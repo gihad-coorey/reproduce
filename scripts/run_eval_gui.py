@@ -3,12 +3,14 @@ import os
 import time
 import argparse
 import tkinter as tk
+import uuid
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 import numpy as np
 import torch
 from PIL import Image, ImageTk
+from libero.libero import benchmark
 
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -20,7 +22,18 @@ from lerobot.utils.constants import ACTION
 
 TASK_FILE = Path("configs/tasks.json")
 DEFAULT_RESULTS_FILE = Path("results/gui_eval_results.json")
+DEFAULT_FRAMES_DIR = Path("results/gui_frames")
 OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
+
+
+def emit_event(event, run_id, **data):
+    entry = {
+        "ts": time.time(),
+        "event": event,
+        "run_id": run_id,
+    }
+    entry.update(data)
+    print(json.dumps(entry, separators=(",", ":")), flush=True)
 
 
 def parse_args():
@@ -28,12 +41,10 @@ def parse_args():
         description="Launch the SmolVLA LIBERO evaluation GUI.",
         epilog=(
             "Examples:\n"
-            "  python scripts/run_eval_gui.py\n"
-            "  python scripts/run_eval_gui.py --smoke"
+            "  python scripts/run_eval_gui.py"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--smoke", action="store_true", help="Preselect first task and set episodes=1")
     return parser.parse_args()
 
 
@@ -153,11 +164,13 @@ def run_single_task(
     postprocessor,
     task_name,
     episodes,
+    run_id,
     progress_cb,
     render_frame_cb=None,
     ui_pump_cb=None,
     fallback_preview_cb=None,
     status_cb=None,
+    render_every_n_steps=1,
 ):
     suite_name, task_id = parse_task_name(task_name)
 
@@ -170,6 +183,8 @@ def run_single_task(
     success_count = 0
     try:
         for ep in range(episodes):
+            ep_start = time.time()
+            emit_event("episode_start", run_id, task=task_name, episode=ep + 1, episodes_total=episodes)
             model.reset()
             observation, info = env.reset(seed=[ep])
 
@@ -187,7 +202,6 @@ def run_single_task(
             done = np.array([False])
             max_steps = env.call("_max_episode_steps")[0]
             step = 0
-            last_progress_log_step = 0
             spinner_chars = "|/-\\"
 
             while (not bool(done[0])) and step < max_steps:
@@ -206,7 +220,10 @@ def run_single_task(
                 action_np = action.to("cpu").numpy()
 
                 observation, _reward, terminated, truncated, info = env.step(action_np)
-                if render_frame_cb is not None:
+                done = terminated | truncated | done
+                step += 1
+
+                if render_frame_cb is not None and (step % render_every_n_steps == 0):
                     frame = extract_render_frame(env)
                     if frame is not None:
                         render_frame_cb(frame)
@@ -214,8 +231,6 @@ def run_single_task(
                         fallback = extract_preview_from_observation(observation)
                         if fallback is not None:
                             fallback_preview_cb(fallback)
-                done = terminated | truncated | done
-                step += 1
 
                 # Lightweight heartbeat in status line every 5 steps.
                 if status_cb is not None and (step % 5 == 0):
@@ -224,13 +239,8 @@ def run_single_task(
                         f"Running {task_name} ep {ep + 1}/{episodes}: step {step}/{max_steps} {spinner}"
                     )
 
-                # Log progress more sparsely to avoid Tk Text widget stalls.
-                if (step - last_progress_log_step) >= 50 or step == max_steps:
-                    last_progress_log_step = step
-                    progress_cb(f"Progress: {task_name} ep {ep + 1}/{episodes} step {step}/{max_steps}")
-
                 # Keep Tk responsive while rollout runs on main thread.
-                if ui_pump_cb is not None and (step % 20 == 0):
+                if ui_pump_cb is not None and (step % 5 == 0):
                     ui_pump_cb()
 
                 if "final_info" in info and info["final_info"]["is_success"][0]:
@@ -238,6 +248,17 @@ def run_single_task(
                     break
 
             progress_cb(f"{task_name}: episode {ep + 1}/{episodes} complete (steps: {step}/{max_steps})")
+            episode_success = int("final_info" in info and info["final_info"]["is_success"][0])
+            emit_event(
+                "episode_end",
+                run_id,
+                task=task_name,
+                episode=ep + 1,
+                steps=step,
+                max_steps=max_steps,
+                success=episode_success,
+                episode_s=float(time.time() - ep_start),
+            )
 
     finally:
         env.close()
@@ -246,14 +267,17 @@ def run_single_task(
 
 
 class EvalGuiApp:
-    def __init__(self, root, smoke_mode=False):
+    def __init__(self, root):
         self.root = root
         self.root.title("SmolVLA LIBERO Eval GUI")
         self.root.geometry("980x820")
 
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.model_var = tk.StringVar(value=OFFICIAL_MODEL_ID)
-        self.episodes_var = tk.StringVar(value="2")
+        self.episodes_var = tk.StringVar(value="1")
+        self.render_every_var = tk.StringVar(value="10")
+        self.save_frames_var = tk.BooleanVar(value=False)
+        self.frames_dir_var = tk.StringVar(value=str(DEFAULT_FRAMES_DIR))
         self.results_var = tk.StringVar(value=str(DEFAULT_RESULTS_FILE))
         self._preview_photo = None
         self._latest_frame = None
@@ -262,15 +286,13 @@ class EvalGuiApp:
         self._first_frame_seen = False
         self._fallback_preview_used = False
         self._last_ui_pump_time = 0.0
-        self._smoke_mode = smoke_mode
+        self._last_preview_draw_time = 0.0
+        self._saved_frame_count = 0
+        self._frame_output_dir = None
+        self.task_instruction_map = {}
 
         self._build_ui()
         self._load_tasks()
-        if self._smoke_mode:
-            self.episodes_var.set("1")
-            if self.task_list.size() > 0:
-                self.task_list.selection_clear(0, tk.END)
-                self.task_list.select_set(0)
         self.root.after(50, self._update_preview)
 
     def _build_ui(self):
@@ -283,13 +305,36 @@ class EvalGuiApp:
         ttk.Label(frm, text="LIBERO Task List (multi-select)").pack(anchor=tk.W)
         self.task_list = tk.Listbox(frm, selectmode=tk.EXTENDED, height=12)
         self.task_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.task_list.bind("<<ListboxSelect>>", self._on_task_selection_changed)
+
+        ttk.Label(frm, text="Selected Task Instruction").pack(anchor=tk.W)
+        self.task_instruction_var = tk.StringVar(value="Select a task to view its language instruction.")
+        ttk.Label(
+            frm,
+            textvariable=self.task_instruction_var,
+            justify=tk.LEFT,
+            wraplength=920,
+        ).pack(fill=tk.X, pady=(0, 8))
 
         row = ttk.Frame(frm)
         row.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(row, text="Episodes per task").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.episodes_var, width=8).pack(side=tk.LEFT, padx=(8, 16))
+        ttk.Label(row, text="Render every N steps").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.render_every_var, width=8).pack(side=tk.LEFT, padx=(8, 16))
         ttk.Label(row, text="Results JSON path").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.results_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        frames_row = ttk.Frame(frm)
+        frames_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(frames_row, text="Save rendered frames", variable=self.save_frames_var).pack(side=tk.LEFT)
+        ttk.Label(frames_row, text="Frames output dir").pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Entry(frames_row, textvariable=self.frames_dir_var).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+            padx=(8, 0),
+        )
 
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill=tk.X, pady=(0, 8))
@@ -329,6 +374,54 @@ class EvalGuiApp:
         self.task_list.delete(0, tk.END)
         for t in tasks:
             self.task_list.insert(tk.END, t)
+        self.task_instruction_map = self._build_task_instruction_map(tasks)
+        self._on_task_selection_changed()
+
+    def _build_task_instruction_map(self, tasks):
+        instruction_map = {}
+        suites = {}
+        for task_name in tasks:
+            instruction_map[task_name] = task_name
+            try:
+                suite_name, task_id = parse_task_name(task_name)
+            except Exception:
+                continue
+
+            suite = suites.get(suite_name)
+            if suite is None:
+                try:
+                    suite_ctor = benchmark.get_benchmark_dict()[suite_name]
+                    suite = suite_ctor()
+                    suites[suite_name] = suite
+                except Exception:
+                    continue
+
+            try:
+                instruction = suite.tasks[task_id].language
+                if isinstance(instruction, str) and instruction.strip():
+                    instruction_map[task_name] = instruction.strip()
+            except Exception:
+                continue
+
+        return instruction_map
+
+    def _on_task_selection_changed(self, _event=None):
+        selected = [self.task_list.get(i) for i in self.task_list.curselection()]
+        if not selected:
+            self.task_instruction_var.set("Select a task to view its language instruction.")
+            return
+
+        if len(selected) == 1:
+            task = selected[0]
+            instruction = self.task_instruction_map.get(task, task)
+            self.task_instruction_var.set(f"{task}: {instruction}")
+            return
+
+        lines = []
+        for task in selected:
+            instruction = self.task_instruction_map.get(task, task)
+            lines.append(f"- {task}: {instruction}")
+        self.task_instruction_var.set("\n".join(lines))
 
     def _select_all(self):
         self.task_list.select_set(0, tk.END)
@@ -348,7 +441,43 @@ class EvalGuiApp:
         if (now - self._last_ui_pump_time) < 0.15:
             return
         self._last_ui_pump_time = now
+        # `update()` processes timer callbacks (e.g. `after`) so live preview
+        # continues updating during long rollout loops on the main thread.
+        self.root.update()
+
+    def _draw_preview_frame(self, frame):
+        display = normalize_frame_for_display(frame)
+        if display is None:
+            self.preview_status_var.set("Preview waiting: unsupported frame format")
+            if self._preview_errors < 3:
+                self._preview_errors += 1
+                self._append_log("Preview warning: unsupported frame format from env.render()")
+            return
+
+        img = Image.fromarray(display).resize((512, 512), Image.Resampling.BILINEAR)
+        self._preview_photo = ImageTk.PhotoImage(img)
+        self.preview_label.configure(image=self._preview_photo, text="")
+        h, w = display.shape[:2]
+        self.preview_status_var.set(f"Preview active: {w}x{h}")
+        # Flush pending widget draws so preview appears immediately during rollout.
         self.root.update_idletasks()
+
+    def _draw_preview_if_due(self):
+        frame = self._latest_frame
+        if frame is None:
+            return
+        now = time.time()
+        # Limit redraws to avoid excessive image conversions during inference.
+        if (now - self._last_preview_draw_time) < 0.06:
+            return
+        self._last_preview_draw_time = now
+        try:
+            self._draw_preview_frame(frame)
+        except Exception:
+            self.preview_status_var.set("Preview error: failed to convert frame")
+            if self._preview_errors < 3:
+                self._preview_errors += 1
+                self._append_log("Preview warning: failed to convert render frame")
 
     def _set_latest_frame(self, frame):
         if frame is None:
@@ -357,6 +486,7 @@ class EvalGuiApp:
         if not self._first_frame_seen:
             self._first_frame_seen = True
             self._append_log("Preview: received first render frame")
+        self._draw_preview_if_due()
 
     def _set_latest_frame_fallback(self, frame):
         if frame is None:
@@ -367,28 +497,28 @@ class EvalGuiApp:
         if not self._fallback_preview_used:
             self._fallback_preview_used = True
             self._append_log("Preview: using observation camera fallback (env.render() unavailable)")
+        self._draw_preview_if_due()
+
+    def _save_frame_if_enabled(self, frame):
+        if self._frame_output_dir is None:
+            return
+        display = normalize_frame_for_display(frame)
+        if display is None:
+            return
+        frame_path = self._frame_output_dir / f"frame_{self._saved_frame_count:07d}.png"
+        Image.fromarray(display).save(frame_path)
+        self._saved_frame_count += 1
+
+    def _handle_rendered_frame(self, frame):
+        self._set_latest_frame(frame)
+        self._save_frame_if_enabled(frame)
+
+    def _handle_fallback_frame(self, frame):
+        self._set_latest_frame_fallback(frame)
+        self._save_frame_if_enabled(frame)
 
     def _update_preview(self):
-        frame = self._latest_frame
-        if frame is not None:
-            try:
-                display = normalize_frame_for_display(frame)
-                if display is not None:
-                    img = Image.fromarray(display).resize((512, 512), Image.Resampling.BILINEAR)
-                    self._preview_photo = ImageTk.PhotoImage(img)
-                    self.preview_label.configure(image=self._preview_photo, text="")
-                    h, w = display.shape[:2]
-                    self.preview_status_var.set(f"Preview active: {w}x{h}")
-                else:
-                    self.preview_status_var.set("Preview waiting: unsupported frame format")
-                    if self._preview_errors < 3:
-                        self._preview_errors += 1
-                        self._append_log("Preview warning: unsupported frame format from env.render()")
-            except Exception:
-                self.preview_status_var.set("Preview error: failed to convert frame")
-                if self._preview_errors < 3:
-                    self._preview_errors += 1
-                    self._append_log("Preview warning: failed to convert render frame")
+        self._draw_preview_if_due()
         self.root.after(50, self._update_preview)
 
     def _validate_inputs(self):
@@ -405,10 +535,24 @@ class EvalGuiApp:
             messagebox.showerror("Bad episodes", "Episodes per task must be a positive integer.")
             return None
 
+        try:
+            render_every_n_steps = int(self.render_every_var.get())
+            if render_every_n_steps <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Bad render frequency", "Render every N steps must be a positive integer.")
+            return None
+
         model_path = self.model_var.get()
         result_path = Path(self.results_var.get())
+        save_frames = bool(self.save_frames_var.get())
+        frames_dir = Path(self.frames_dir_var.get())
 
-        return selected, episodes, model_path, result_path
+        if save_frames and not str(frames_dir).strip():
+            messagebox.showerror("Bad frames path", "Frames output dir cannot be empty when saving frames.")
+            return None
+
+        return selected, episodes, render_every_n_steps, save_frames, frames_dir, model_path, result_path
 
     def _start_run(self):
         if self._is_running:
@@ -417,19 +561,55 @@ class EvalGuiApp:
         if validated is None:
             return
 
-        selected, episodes, model_path, result_path = validated
+        selected, episodes, render_every_n_steps, save_frames, frames_dir, model_path, result_path = validated
         self._is_running = True
         self.run_button.configure(state=tk.DISABLED)
         # On macOS, creating LIBERO/MuJoCo envs in a worker thread can trigger
         # hard crashes (Trace/BPT trap). Run eval on the Tk main thread.
-        self.root.after(0, lambda: self._run_eval(selected, episodes, model_path, result_path))
+        self.root.after(
+            0,
+            lambda: self._run_eval(
+                selected,
+                episodes,
+                render_every_n_steps,
+                save_frames,
+                frames_dir,
+                model_path,
+                result_path,
+            ),
+        )
 
-    def _run_eval(self, selected, episodes, model_path, result_path):
+    def _run_eval(
+        self,
+        selected,
+        episodes,
+        render_every_n_steps,
+        save_frames,
+        frames_dir,
+        model_path,
+        result_path,
+    ):
+        run_id = str(uuid.uuid4())
         try:
             os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            emit_event(
+                "run_start",
+                run_id,
+                mode="gui",
+                tasks_total=len(selected),
+                episodes_per_task=episodes,
+                device=self.device,
+            )
 
             self._set_run_status("Starting evaluation...")
             self._append_log(f"Device: {self.device}")
+            self._append_log(f"Render frame frequency: every {render_every_n_steps} step(s)")
+            self._frame_output_dir = None
+            self._saved_frame_count = 0
+            if save_frames:
+                self._frame_output_dir = frames_dir / run_id
+                self._frame_output_dir.mkdir(parents=True, exist_ok=True)
+                self._append_log(f"Saving rendered frames to {self._frame_output_dir}")
             self._append_log(f"Loading model from {model_path}...")
             self._pump_ui()
             model = SmolVLAPolicy.from_pretrained(model_path)
@@ -450,9 +630,10 @@ class EvalGuiApp:
             )
 
             results = {}
-            for task in selected:
+            for task_idx, task in enumerate(selected, start=1):
                 self._append_log(f"Running: {task}")
                 self._set_run_status(f"Running {task}...")
+                emit_event("task_start", run_id, task=task, task_index=task_idx, tasks_total=len(selected))
                 self._pump_ui()
                 sr = run_single_task(
                     model=model,
@@ -460,14 +641,17 @@ class EvalGuiApp:
                     postprocessor=postprocessor,
                     task_name=task,
                     episodes=episodes,
+                    run_id=run_id,
                     progress_cb=self._append_log,
-                    render_frame_cb=self._set_latest_frame,
+                    render_frame_cb=self._handle_rendered_frame,
                     ui_pump_cb=self._pump_ui,
-                    fallback_preview_cb=self._set_latest_frame_fallback,
+                    fallback_preview_cb=self._handle_fallback_frame,
                     status_cb=self._set_run_status,
+                    render_every_n_steps=render_every_n_steps,
                 )
                 results[task] = float(sr)
                 self._append_log(f"Done: {task} success_rate={sr:.3f}")
+                emit_event("task_end", run_id, task=task, success_rate=float(sr))
 
             if not self._first_frame_seen:
                 self._append_log("Preview: no frames received; env.render() may be unavailable in this run")
@@ -479,25 +663,34 @@ class EvalGuiApp:
             self._append_log("\n===== GUI EVAL RESULTS =====")
             for k, v in results.items():
                 self._append_log(f"{k}: {v:.3f}")
+            if save_frames:
+                self._append_log(f"Saved {self._saved_frame_count} frame(s) to {self._frame_output_dir}")
             self._append_log(f"Saved results to {result_path}")
+            emit_event(
+                "run_end",
+                run_id,
+                status="ok",
+                mean_success_rate=float(np.mean(list(results.values()))),
+                tasks_completed=len(results),
+            )
             self._set_run_status("Done")
 
         except Exception as exc:
             self._append_log(f"ERROR: {exc}")
+            emit_event("run_end", run_id, status="failed", error=str(exc))
             messagebox.showerror("Evaluation failed", str(exc))
             self._set_run_status("Failed")
         finally:
+            self._frame_output_dir = None
             self._is_running = False
             self.run_button.configure(state=tk.NORMAL)
 
 
 def main():
-    args = parse_args()
+    parse_args()
     root = tk.Tk()
-    app = EvalGuiApp(root, smoke_mode=args.smoke)
+    app = EvalGuiApp(root)
     app._append_log("Ready. Select model and tasks, then click Run Eval.")
-    if args.smoke:
-        app._append_log("Smoke mode enabled: first task selected and episodes set to 1")
     root.mainloop()
 
 
