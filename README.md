@@ -23,6 +23,31 @@ Parallelization note:
 - `N_ENVS_PER_TASK = 4` parallelizes rollout workers inside a task.
 - It improves throughput, but does not change the total experiment count above.
 
+## Runtime Policy Selection
+
+The eval script supports runtime policy selection from a hardcoded registry in
+`scripts/run_eval.py` (`POLICY_REGISTRY`).
+
+Current policy options:
+- `MyPolicy`
+- `Official SmolVLA`
+
+How to use it:
+- Interactive prompt (default when no `--policy` is provided):
+	- `python scripts/run_eval.py`
+- List configured options:
+	- `python scripts/run_eval.py --list-policies`
+- Select explicitly by name:
+	- `python scripts/run_eval.py --policy "MyPolicy" --smoke`
+	- `python scripts/run_eval.py --policy "Official SmolVLA" --smoke`
+
+Checkpoint behavior:
+- The checkpoint is fixed to `HuggingFaceVLA/smolvla_libero` for all registered policies.
+- The policy choice changes which class is instantiated, not which checkpoint path is used.
+
+To add more policies later, add a new entry to `POLICY_REGISTRY` with:
+- `build_model`: a callable that loads and returns a policy instance
+
 ## Headless Frame Dump (For Later Video Creation)
 
 If your goal is smooth demo videos, headless frame dumping is usually faster and more stable than live GUI rendering.

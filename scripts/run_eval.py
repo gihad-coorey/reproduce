@@ -1,9 +1,14 @@
 import json
 import os
+import sys
 import argparse
 import time
 import uuid
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
 
 import imageio
 import numpy as np
@@ -17,7 +22,7 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.scripts.lerobot_eval import eval_one
 from lerobot.utils.constants import ACTION
-
+from my_policies.modeling_mypolicy import MyPolicy
 
 TASK_FILE = "configs/tasks.json"
 OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
@@ -32,6 +37,73 @@ USE_ASYNC_ENVS = False
 # Set to "0" in your shell to test whether MPS fallback is hiding slow CPU fallbacks.
 # Example: PYTORCH_ENABLE_MPS_FALLBACK=0 python ./scripts/run_eval.py --smoke
 MPS_FALLBACK = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+POLICY_REGISTRY = {
+	"MyPolicy": {
+		"build_model": lambda: MyPolicy.from_pretrained(OFFICIAL_MODEL_ID),
+	},
+	"Huggingface SmolVLA Libero": {
+		"build_model": lambda: SmolVLAPolicy.from_pretrained(OFFICIAL_MODEL_ID),
+	},
+}
+
+
+def build_policy_choices():
+	"""Build selectable policies from hardcoded registry."""
+	choices = []
+	for name, entry in POLICY_REGISTRY.items():
+		choices.append(
+			{
+				"id": name,
+				"label": name,
+				"build_model": entry["build_model"],
+			}
+		)
+	return choices
+
+
+def _print_policy_choices(choices):
+	print("\nAvailable policies:")
+	for idx, choice in enumerate(choices, start=1):
+		print(f"  [{idx}] {choice['label']}")
+
+
+def _prompt_for_policy_choice(choices):
+	while True:
+		selection = input("Select policy number (Enter for 1): ").strip()
+		if selection == "":
+			return choices[0]
+		if selection.isdigit():
+			idx = int(selection)
+			if 1 <= idx <= len(choices):
+				return choices[idx - 1]
+		print(f"Invalid selection: {selection}. Enter a number from 1 to {len(choices)}.")
+
+
+def select_policy_runtime(args):
+	"""Resolve policy builder from args and optional user prompts."""
+	choices = build_policy_choices()
+
+	if args.list_policies:
+		_print_policy_choices(choices)
+		sys.exit(0)
+
+	if args.policy:
+		for choice in choices:
+			if args.policy == choice["id"]:
+				return choice["build_model"], choice["label"]
+
+		valid_names = ", ".join(choice["id"] for choice in choices)
+		raise ValueError(f"Unknown --policy '{args.policy}'. Valid options: {valid_names}")
+
+	if sys.stdin.isatty():
+		_print_policy_choices(choices)
+		selected = _prompt_for_policy_choice(choices)
+		return selected["build_model"], selected["label"]
+
+	default_choice = choices[0]
+	return default_choice["build_model"], default_choice["label"]
 
 
 def emit_event(event, run_id, **data):
@@ -51,8 +123,8 @@ def parse_task_name(task_name):
 	return suite_name, int(task_id)
 
 
-def load_model(model_path):
-	model = SmolVLAPolicy.from_pretrained(model_path)
+def load_model(build_model):
+	model = build_model()
 	model.to(torch.device(DEVICE))
 	model.eval()
 	return model
@@ -281,7 +353,10 @@ def parse_args():
 		description="Run SmolVLA LIBERO evaluation from the terminal.",
 		epilog=(
 			"Examples:\n"
-			"  python scripts/run_eval.py\n"
+			"  python scripts/run_eval.py                      # interactive policy prompt\n"
+			"  python scripts/run_eval.py --list-policies\n"
+			"  python scripts/run_eval.py --policy MyPolicy --smoke\n"
+			"  python scripts/run_eval.py --policy Official SmolVLA --smoke\n"
 			"  python scripts/run_eval.py --smoke\n"
 			"  python scripts/run_eval.py --save-frames\n"
 			"  python scripts/run_eval.py --save-frames 10"
@@ -289,6 +364,20 @@ def parse_args():
 		formatter_class=argparse.RawTextHelpFormatter,
 	)
 	parser.add_argument("--smoke", action="store_true", help="Run only first task with fewer episodes")
+	parser.add_argument(
+		"--policy",
+		type=str,
+		default=None,
+		help=(
+			"Policy name from hardcoded POLICY_REGISTRY (e.g., 'MyPolicy', 'Official SmolVLA'). "
+			"If omitted, you will be prompted at runtime in interactive terminals."
+		),
+	)
+	parser.add_argument(
+		"--list-policies",
+		action="store_true",
+		help="Print configured policy options and exit.",
+	)
 	parser.add_argument(
 		"--save-frames",
 		nargs="?",
@@ -313,6 +402,7 @@ def main():
 	render_every_n_steps = args.save_frames if save_frames_enabled else 0
 
 	run_id = str(uuid.uuid4())
+	build_model, policy_label = select_policy_runtime(args)
 	model_path = OFFICIAL_MODEL_ID
 	result_path = DEFAULT_RESULT_PATH
 
@@ -342,9 +432,14 @@ def main():
 		save_frames=save_frames_enabled,
 		render_every_n_steps=int(render_every_n_steps),
 		frames_root=DEFAULT_FRAMES_ROOT,
+		policy=policy_label,
+		model_path=model_path,
 	)
 
-	model = load_model(model_path)
+	print(f"Selected policy: {policy_label}")
+	print(f"Selected checkpoint: {model_path}")
+
+	model = load_model(build_model)
 	rename_map = build_rename_map(model)
 	
 	preprocessor, postprocessor = make_pre_post_processors(

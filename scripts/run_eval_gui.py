@@ -1,4 +1,5 @@
 import json
+import sys
 import os
 import time
 import argparse
@@ -19,11 +20,25 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import ACTION
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
+    
+from my_policies.modeling_mypolicy import MyPolicy
 
 TASK_FILE = Path("configs/tasks.json")
 DEFAULT_RESULTS_FILE = Path("results/gui_eval_results.json")
 DEFAULT_FRAMES_DIR = Path("results/gui_frames")
 OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
+
+POLICY_REGISTRY = {
+    "MyPolicy": {
+        "build_model": lambda: MyPolicy.from_pretrained(OFFICIAL_MODEL_ID),
+    },
+    "Official SmolVLA": {
+        "build_model": lambda: SmolVLAPolicy.from_pretrained(OFFICIAL_MODEL_ID),
+    },
+}
 
 
 def emit_event(event, run_id, **data):
@@ -273,7 +288,7 @@ class EvalGuiApp:
         self.root.geometry("980x820")
 
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
-        self.model_var = tk.StringVar(value=OFFICIAL_MODEL_ID)
+        self.policy_var = tk.StringVar(value="MyPolicy")
         self.episodes_var = tk.StringVar(value="1")
         self.render_every_var = tk.StringVar(value="10")
         self.save_frames_var = tk.BooleanVar(value=False)
@@ -299,8 +314,18 @@ class EvalGuiApp:
         frm = ttk.Frame(self.root, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frm, text="Model").pack(anchor=tk.W)
-        ttk.Entry(frm, textvariable=self.model_var, state="readonly").pack(fill=tk.X, pady=(0, 8))
+        policy_row = ttk.Frame(frm)
+        policy_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(policy_row, text="Policy").pack(side=tk.LEFT)
+        policy_combo = ttk.Combobox(
+            policy_row,
+            textvariable=self.policy_var,
+            values=list(POLICY_REGISTRY.keys()),
+            state="readonly",
+            width=24,
+        )
+        policy_combo.pack(side=tk.LEFT, padx=(8, 16))
+        ttk.Label(policy_row, text=f"Checkpoint: {OFFICIAL_MODEL_ID}").pack(side=tk.LEFT)
 
         ttk.Label(frm, text="LIBERO Task List (multi-select)").pack(anchor=tk.W)
         self.task_list = tk.Listbox(frm, selectmode=tk.EXTENDED, height=12)
@@ -543,7 +568,11 @@ class EvalGuiApp:
             messagebox.showerror("Bad render frequency", "Render every N steps must be a positive integer.")
             return None
 
-        model_path = self.model_var.get()
+        policy_name = self.policy_var.get().strip()
+        if policy_name not in POLICY_REGISTRY:
+            messagebox.showerror("Bad policy", f"Unknown policy '{policy_name}'.")
+            return None
+
         result_path = Path(self.results_var.get())
         save_frames = bool(self.save_frames_var.get())
         frames_dir = Path(self.frames_dir_var.get())
@@ -552,7 +581,7 @@ class EvalGuiApp:
             messagebox.showerror("Bad frames path", "Frames output dir cannot be empty when saving frames.")
             return None
 
-        return selected, episodes, render_every_n_steps, save_frames, frames_dir, model_path, result_path
+        return selected, episodes, render_every_n_steps, save_frames, frames_dir, policy_name, result_path
 
     def _start_run(self):
         if self._is_running:
@@ -561,7 +590,7 @@ class EvalGuiApp:
         if validated is None:
             return
 
-        selected, episodes, render_every_n_steps, save_frames, frames_dir, model_path, result_path = validated
+        selected, episodes, render_every_n_steps, save_frames, frames_dir, policy_name, result_path = validated
         self._is_running = True
         self.run_button.configure(state=tk.DISABLED)
         # On macOS, creating LIBERO/MuJoCo envs in a worker thread can trigger
@@ -574,7 +603,7 @@ class EvalGuiApp:
                 render_every_n_steps,
                 save_frames,
                 frames_dir,
-                model_path,
+                policy_name,
                 result_path,
             ),
         )
@@ -586,7 +615,7 @@ class EvalGuiApp:
         render_every_n_steps,
         save_frames,
         frames_dir,
-        model_path,
+        policy_name,
         result_path,
     ):
         run_id = str(uuid.uuid4())
@@ -599,6 +628,8 @@ class EvalGuiApp:
                 tasks_total=len(selected),
                 episodes_per_task=episodes,
                 device=self.device,
+                policy=policy_name,
+                model_path=OFFICIAL_MODEL_ID,
             )
 
             self._set_run_status("Starting evaluation...")
@@ -610,9 +641,10 @@ class EvalGuiApp:
                 self._frame_output_dir = frames_dir / run_id
                 self._frame_output_dir.mkdir(parents=True, exist_ok=True)
                 self._append_log(f"Saving rendered frames to {self._frame_output_dir}")
-            self._append_log(f"Loading model from {model_path}...")
+            self._append_log(f"Selected policy: {policy_name}")
+            self._append_log(f"Loading model from {OFFICIAL_MODEL_ID}...")
             self._pump_ui()
-            model = SmolVLAPolicy.from_pretrained(model_path)
+            model = POLICY_REGISTRY[policy_name]["build_model"]()
             model.to(torch.device(self.device))
             model.eval()
 
@@ -622,7 +654,7 @@ class EvalGuiApp:
             self._pump_ui()
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=model.config,
-                pretrained_path=model_path,
+                pretrained_path=OFFICIAL_MODEL_ID,
                 preprocessor_overrides={
                     "device_processor": {"device": self.device},
                     "rename_observations_processor": {"rename_map": rename_map},
@@ -690,7 +722,7 @@ def main():
     parse_args()
     root = tk.Tk()
     app = EvalGuiApp(root)
-    app._append_log("Ready. Select model and tasks, then click Run Eval.")
+    app._append_log("Ready. Select policy and tasks, then click Run Eval.")
     root.mainloop()
 
 
