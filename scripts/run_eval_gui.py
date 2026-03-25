@@ -24,17 +24,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
     
-from my_policies.modeling_mypolicy import MyPolicy
-
 TASK_FILE = Path("configs/tasks.json")
 DEFAULT_RESULTS_FILE = Path("results/gui_eval_results.json")
 DEFAULT_FRAMES_DIR = Path("results/gui_frames")
 OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
 
 POLICY_REGISTRY = {
-    "MyPolicy": {
-        "build_model": lambda: MyPolicy.from_pretrained(OFFICIAL_MODEL_ID),
-    },
     "Official SmolVLA": {
         "build_model": lambda: SmolVLAPolicy.from_pretrained(OFFICIAL_MODEL_ID),
     },

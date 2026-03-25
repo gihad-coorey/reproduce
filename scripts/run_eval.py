@@ -4,6 +4,7 @@ import sys
 import argparse
 import time
 import uuid
+import random
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,7 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.scripts.lerobot_eval import eval_one
 from lerobot.utils.constants import ACTION
-from my_policies.modeling_mypolicy import MyPolicy
+from lerobot.utils.random_utils import set_seed
 
 TASK_FILE = "configs/tasks.json"
 OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
@@ -37,12 +38,11 @@ USE_ASYNC_ENVS = False
 # Set to "0" in your shell to test whether MPS fallback is hiding slow CPU fallbacks.
 # Example: PYTORCH_ENABLE_MPS_FALLBACK=0 python ./scripts/run_eval.py --smoke
 MPS_FALLBACK = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+DEFAULT_SEED = 0
+DETERMINISTIC_MODE = True
 
 
 POLICY_REGISTRY = {
-	"MyPolicy": {
-		"build_model": lambda: MyPolicy.from_pretrained(OFFICIAL_MODEL_ID),
-	},
 	"Huggingface SmolVLA Libero": {
 		"build_model": lambda: SmolVLAPolicy.from_pretrained(OFFICIAL_MODEL_ID),
 	},
@@ -128,6 +128,24 @@ def load_model(build_model):
 	model.to(torch.device(DEVICE))
 	model.eval()
 	return model
+
+
+def configure_reproducibility(seed: int, deterministic: bool) -> None:
+	"""Configure Python/NumPy/Torch RNG and deterministic algorithm behavior."""
+	set_seed(seed)
+	random.seed(seed)
+
+	if deterministic:
+		# warn_only avoids hard failures for unsupported deterministic ops on some backends.
+		torch.use_deterministic_algorithms(True, warn_only=True)
+		if torch.cuda.is_available():
+			torch.backends.cudnn.deterministic = True
+			torch.backends.cudnn.benchmark = False
+	else:
+		torch.use_deterministic_algorithms(False)
+		if torch.cuda.is_available():
+			torch.backends.cudnn.deterministic = False
+			torch.backends.cudnn.benchmark = True
 
 
 def build_rename_map(model):
@@ -402,6 +420,7 @@ def main():
 	render_every_n_steps = args.save_frames if save_frames_enabled else 0
 
 	run_id = str(uuid.uuid4())
+	configure_reproducibility(seed=DEFAULT_SEED, deterministic=DETERMINISTIC_MODE)
 	build_model, policy_label = select_policy_runtime(args)
 	model_path = OFFICIAL_MODEL_ID
 	result_path = DEFAULT_RESULT_PATH
@@ -432,6 +451,8 @@ def main():
 		save_frames=save_frames_enabled,
 		render_every_n_steps=int(render_every_n_steps),
 		frames_root=DEFAULT_FRAMES_ROOT,
+		seed=int(DEFAULT_SEED),
+		deterministic=bool(DETERMINISTIC_MODE),
 		policy=policy_label,
 		model_path=model_path,
 	)
@@ -463,6 +484,7 @@ def main():
 	print(
 		f"Eval config: device={DEVICE}, n_envs={n_envs_runtime}, "
 		f"use_async_envs={USE_ASYNC_ENVS}, mps_fallback={MPS_FALLBACK}, "
+		f"seed={DEFAULT_SEED}, deterministic={DETERMINISTIC_MODE}, "
 		f"episodes_per_task={episodes_per_task}, save_frames={save_frames_enabled}, "
 		f"render_every_n_steps={render_every_n_steps if save_frames_enabled else 'off'}"
 	)

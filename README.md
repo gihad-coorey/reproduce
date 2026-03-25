@@ -29,7 +29,6 @@ The eval script supports runtime policy selection from a hardcoded registry in
 `scripts/run_eval.py` (`POLICY_REGISTRY`).
 
 Current policy options:
-- `MyPolicy`
 - `Official SmolVLA`
 
 How to use it:
