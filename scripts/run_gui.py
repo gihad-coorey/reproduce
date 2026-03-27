@@ -102,8 +102,8 @@ def run_single_task(
         if ui_pump_cb is not None and (step % 5 == 0):
             ui_pump_cb()
 
-    def on_frame(env, observation, _info, step, _episode_index):
-        del _info, step, _episode_index # Unused, but keep to match expected callback signature in `run_task_stepwise`
+    def on_frame(env, observation, _info, step, episode_index):
+        del _info, step, episode_index  # Unused, but keep to match expected callback signature in `run_task_stepwise`
         frame = extract_render_frame(env)
         if frame is not None:
             if render_frame_cb is not None:

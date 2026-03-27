@@ -31,7 +31,6 @@ DEFAULT_N_ENVS_PER_TASK = 4
 RUNTIME_SEED = 0
 RUNTIME_DETERMINISTIC = True
 RUNTIME_MPS_FALLBACK = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-EVENT_SCHEMA_VERSION = 1
 
 
 def resolve_runtime_device() -> str:
@@ -138,7 +137,6 @@ def build_default_result_path(
 
 def emit_event(event: str, run_id: str, **data) -> None:
     payload = {
-        "schema_version": EVENT_SCHEMA_VERSION,
         "event": event,
         "run_id": run_id,
         "ts": time.time(),
