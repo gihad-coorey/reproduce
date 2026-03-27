@@ -1,0 +1,9 @@
+# The following information is stored in the config file: /Users/GihadCoorey11/.libero/config.yaml
+# This file is used by the Libero module to determine where the Libero assets are located.
+# You can set the LIBERO_CONFIG_PATH environment variable to point to a different config file (such as this one) if you want to specify a different location for the Libero assets. See .env.example for more information.
+
+# benchmark_root: /Users/GihadCoorey11/miniconda3/envs/geng/lib/python3.10/site-packages/libero/libero
+# bddl_files: /Users/GihadCoorey11/miniconda3/envs/geng/lib/python3.10/site-packages/libero/libero/./bddl_files
+# init_states: /Users/GihadCoorey11/miniconda3/envs/geng/lib/python3.10/site-packages/libero/libero/./init_files
+# datasets: /Users/GihadCoorey11/miniconda3/envs/geng/lib/python3.10/site-packages/libero/libero/../datasets
+# assets: /Users/GihadCoorey11/miniconda3/envs/geng/lib/python3.10/site-packages/libero/libero/./assets

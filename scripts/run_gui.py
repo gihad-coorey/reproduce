@@ -2,147 +2,42 @@ import json
 import sys
 import os
 import time
-import argparse
 import tkinter as tk
 import uuid
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 import numpy as np
-import torch
 from PIL import Image, ImageTk
 from libero.libero import benchmark
-
-from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
-from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.utils import add_envs_task, preprocess_observation
-from lerobot.policies.factory import make_pre_post_processors
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-from lerobot.utils.constants import ACTION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
-    
-TASK_FILE = Path("configs/tasks.json")
-DEFAULT_RESULTS_FILE = Path("results/gui_eval_results.json")
+from scripts.common import (
+    DEFAULT_TASK_FILE,
+    OFFICIAL_MODEL_ID,
+    POLICY_REGISTRY,
+    RUNTIME_DETERMINISTIC,
+    RUNTIME_MPS_FALLBACK,
+    RUNTIME_SEED,
+    build_default_result_path,
+    configure_reproducibility,
+    emit_event,
+    extract_preview_from_observation,
+    extract_render_frame,
+    load_policy_and_processors,
+    normalize_frame_uint8,
+    parse_task_name,
+    resolve_project_path,
+    resolve_runtime_device,
+    run_task_stepwise,
+)
+
+TASK_FILE = resolve_project_path(DEFAULT_TASK_FILE, PROJECT_ROOT)
 DEFAULT_FRAMES_DIR = Path("results/gui_frames")
-OFFICIAL_MODEL_ID = "HuggingFaceVLA/smolvla_libero"
-
-POLICY_REGISTRY = {
-    "Official SmolVLA": {
-        "build_model": lambda: SmolVLAPolicy.from_pretrained(OFFICIAL_MODEL_ID),
-    },
-}
-
-
-def emit_event(event, run_id, **data):
-    entry = {
-        "ts": time.time(),
-        "event": event,
-        "run_id": run_id,
-    }
-    entry.update(data)
-    print(json.dumps(entry, separators=(",", ":")), flush=True)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Launch the SmolVLA LIBERO evaluation GUI.",
-        epilog=(
-            "Examples:\n"
-            "  python scripts/run_eval_gui.py"
-        ),
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-    return parser.parse_args()
-
-
-def build_rename_map(model):
-    feature_keys = set(model.config.input_features.keys())
-    rename_map = {}
-    if "observation.images.camera1" in feature_keys:
-        rename_map["observation.images.image"] = "observation.images.camera1"
-    if "observation.images.camera2" in feature_keys:
-        rename_map["observation.images.image2"] = "observation.images.camera2"
-    if "observation.images.wrist_image" in feature_keys:
-        rename_map["observation.images.image2"] = "observation.images.wrist_image"
-    if "observation.images.image" in feature_keys:
-        rename_map.pop("observation.images.image", None)
-    return rename_map
-
-
-def parse_task_name(task_name):
-    if "_task_" not in task_name:
-        raise ValueError(f"Unexpected task format: {task_name}")
-    suite_name, task_id = task_name.rsplit("_task_", 1)
-    return suite_name, int(task_id)
-
-
-def extract_render_frame(env):
-    """Safely extract a rendered RGB frame from the vectorized env."""
-    try:
-        frames = env.call("render")
-        if isinstance(frames, (list, tuple)) and frames:
-            frame = frames[0]
-            if frame is not None:
-                return frame
-        if isinstance(frames, np.ndarray):
-            return frames
-    except Exception as exc:
-        # Keep evaluation running even if rendering momentarily fails.
-        print(f"Warning: failed to extract render frame: {exc}")
-        return None
-    return None
-
-
-def normalize_frame_for_display(frame):
-    """Normalize a frame into uint8 HWC RGB for Tk preview."""
-    if isinstance(frame, torch.Tensor):
-        frame = frame.detach().cpu().numpy()
-    if not isinstance(frame, np.ndarray):
-        return None
-
-    # Handle batch dimensions by selecting the first item.
-    while frame.ndim >= 4:
-        frame = frame[0]
-
-    if frame.ndim == 2:
-        frame = np.repeat(frame[..., None], 3, axis=2)
-    elif frame.ndim == 3 and frame.shape[0] in (1, 3, 4) and frame.shape[-1] not in (1, 3, 4):
-        frame = np.transpose(frame, (1, 2, 0))
-
-    if frame.ndim != 3:
-        return None
-
-    if frame.shape[2] == 1:
-        frame = np.repeat(frame, 3, axis=2)
-    elif frame.shape[2] == 4:
-        frame = frame[:, :, :3]
-
-    if frame.dtype != np.uint8:
-        frame = frame.astype(np.float32)
-        if frame.max() <= 1.0:
-            frame *= 255.0
-        frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
-
-    return frame
-
-
-def extract_preview_from_observation(observation):
-    """Fallback preview source from raw LIBERO observations."""
-    try:
-        pixels = observation.get("pixels")
-        if isinstance(pixels, dict):
-            for key in ("image", "image2"):
-                frame = pixels.get(key)
-                normalized = normalize_frame_for_display(frame)
-                if normalized is not None:
-                    return normalized
-    except Exception as exc:
-        print(f"Warning: failed to extract preview frame: {exc}")
-        return None
-    return None
+DEFAULT_POLICY_NAME = next(iter(POLICY_REGISTRY.keys()))
+DEFAULT_RESULTS_FILE = build_default_result_path(PROJECT_ROOT, DEFAULT_POLICY_NAME, TASK_FILE, prefix="gui_eval")
 
 
 def extract_task_instruction(env, reset_info, task_name):
@@ -182,98 +77,71 @@ def run_single_task(
     status_cb=None,
     render_every_n_steps=1,
 ):
-    suite_name, task_id = parse_task_name(task_name)
+    spinner_chars = "|/-\\"
 
-    env_cfg = LiberoEnvConfig(task=suite_name, task_ids=[task_id], control_mode="relative")
-    envs = make_env(cfg=env_cfg, n_envs=1, use_async_envs=False, trust_remote_code=False)
-    env = envs[suite_name][task_id]
+    def on_episode_reset(env, observation, info, ep_index):
+        ep_start = time.time()
+        emit_event("episode_start", run_id, task=task_name, episode=ep_index + 1, episodes_total=episodes)
+        instruction = extract_task_instruction(env, info, task_name)
+        progress_cb(f"Instruction: {instruction}")
+        if render_frame_cb is not None:
+            frame = extract_render_frame(env)
+            if frame is not None:
+                render_frame_cb(frame)
+            elif fallback_preview_cb is not None:
+                fallback = extract_preview_from_observation(observation)
+                if fallback is not None:
+                    fallback_preview_cb(fallback)
+        episode_starts[ep_index] = ep_start
 
-    env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=model.config)
+    def on_step(step, max_steps, info, ep_index):
+        del info
+        if status_cb is not None and (step % 5 == 0):
+            spinner = spinner_chars[(step // 5) % len(spinner_chars)]
+            status_cb(f"Running {task_name} ep {ep_index + 1}/{episodes}: step {step}/{max_steps} {spinner}")
+        if ui_pump_cb is not None and (step % 5 == 0):
+            ui_pump_cb()
 
-    success_count = 0
-    try:
-        for ep in range(episodes):
-            ep_start = time.time()
-            emit_event("episode_start", run_id, task=task_name, episode=ep + 1, episodes_total=episodes)
-            model.reset()
-            observation, info = env.reset(seed=[ep])
-
-            instruction = extract_task_instruction(env, info, task_name)
-            progress_cb(f"Instruction: {instruction}")
-
+    def on_frame(env, observation, _info, step, _episode_index):
+        del _info, step, _episode_index # Unused, but keep to match expected callback signature in `run_task_stepwise`
+        frame = extract_render_frame(env)
+        if frame is not None:
             if render_frame_cb is not None:
-                frame = extract_render_frame(env)
-                if frame is not None:
-                    render_frame_cb(frame)
-                elif fallback_preview_cb is not None:
-                    fallback = extract_preview_from_observation(observation)
-                    if fallback is not None:
-                        fallback_preview_cb(fallback)
-            done = np.array([False])
-            max_steps = env.call("_max_episode_steps")[0]
-            step = 0
-            spinner_chars = "|/-\\"
+                render_frame_cb(frame)
+        elif fallback_preview_cb is not None:
+            fallback = extract_preview_from_observation(observation)
+            if fallback is not None:
+                fallback_preview_cb(fallback)
 
-            while (not bool(done[0])) and step < max_steps:
-                obs = preprocess_observation(observation)
-                obs = add_envs_task(env, obs)
-                obs = env_preprocessor(obs)
-                obs = preprocessor(obs)
+    def on_episode_end(info, step, max_steps, ep_index):
+        progress_cb(f"{task_name}: episode {ep_index + 1}/{episodes} complete (steps: {step}/{max_steps})")
+        episode_success = int("final_info" in info and info["final_info"]["is_success"][0])
+        emit_event(
+            "episode_end",
+            run_id,
+            task=task_name,
+            episode=ep_index + 1,
+            steps=step,
+            max_steps=max_steps,
+            success=episode_success,
+            episode_s=float(time.time() - episode_starts.get(ep_index, time.time())),
+        )
 
-                with torch.inference_mode():
-                    action = model.select_action(obs)
-
-                action = postprocessor(action)
-                action_transition = {ACTION: action}
-                action_transition = env_postprocessor(action_transition)
-                action = action_transition[ACTION]
-                action_np = action.to("cpu").numpy()
-
-                observation, _reward, terminated, truncated, info = env.step(action_np)
-                done = terminated | truncated | done
-                step += 1
-
-                if render_frame_cb is not None and (step % render_every_n_steps == 0):
-                    frame = extract_render_frame(env)
-                    if frame is not None:
-                        render_frame_cb(frame)
-                    elif fallback_preview_cb is not None:
-                        fallback = extract_preview_from_observation(observation)
-                        if fallback is not None:
-                            fallback_preview_cb(fallback)
-
-                # Lightweight heartbeat in status line every 5 steps.
-                if status_cb is not None and (step % 5 == 0):
-                    spinner = spinner_chars[(step // 5) % len(spinner_chars)]
-                    status_cb(
-                        f"Running {task_name} ep {ep + 1}/{episodes}: step {step}/{max_steps} {spinner}"
-                    )
-
-                # Keep Tk responsive while rollout runs on main thread.
-                if ui_pump_cb is not None and (step % 5 == 0):
-                    ui_pump_cb()
-
-                if "final_info" in info and info["final_info"]["is_success"][0]:
-                    success_count += 1
-                    break
-
-            progress_cb(f"{task_name}: episode {ep + 1}/{episodes} complete (steps: {step}/{max_steps})")
-            episode_success = int("final_info" in info and info["final_info"]["is_success"][0])
-            emit_event(
-                "episode_end",
-                run_id,
-                task=task_name,
-                episode=ep + 1,
-                steps=step,
-                max_steps=max_steps,
-                success=episode_success,
-                episode_s=float(time.time() - ep_start),
-            )
-
-    finally:
-        env.close()
-
-    return success_count / float(episodes)
+    episode_starts: dict[int, float] = {}
+    sr, _build_s, _eval_s = run_task_stepwise(
+        model=model,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        task_name=task_name,
+        n_episodes=episodes,
+        start_seed=RUNTIME_SEED,
+        render_every_n_steps=render_every_n_steps,
+        on_frame=on_frame,
+        on_step=on_step,
+        on_episode_reset=on_episode_reset,
+        on_episode_end=on_episode_end,
+    )
+    return sr
 
 
 class EvalGuiApp:
@@ -282,8 +150,8 @@ class EvalGuiApp:
         self.root.title("SmolVLA LIBERO Eval GUI")
         self.root.geometry("980x820")
 
-        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
-        self.policy_var = tk.StringVar(value="MyPolicy")
+        self.device = resolve_runtime_device()
+        self.policy_var = tk.StringVar(value="HF")
         self.episodes_var = tk.StringVar(value="1")
         self.render_every_var = tk.StringVar(value="10")
         self.save_frames_var = tk.BooleanVar(value=False)
@@ -466,7 +334,7 @@ class EvalGuiApp:
         self.root.update()
 
     def _draw_preview_frame(self, frame):
-        display = normalize_frame_for_display(frame)
+        display = normalize_frame_uint8(frame)
         if display is None:
             self.preview_status_var.set("Preview waiting: unsupported frame format")
             if self._preview_errors < 3:
@@ -522,7 +390,7 @@ class EvalGuiApp:
     def _save_frame_if_enabled(self, frame):
         if self._frame_output_dir is None:
             return
-        display = normalize_frame_for_display(frame)
+        display = normalize_frame_uint8(frame)
         if display is None:
             return
         frame_path = self._frame_output_dir / f"frame_{self._saved_frame_count:07d}.png"
@@ -615,18 +483,15 @@ class EvalGuiApp:
     ):
         run_id = str(uuid.uuid4())
         try:
-            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-            emit_event(
-                "run_start",
-                run_id,
-                mode="gui",
-                tasks_total=len(selected),
-                episodes_per_task=episodes,
-                device=self.device,
-                policy=policy_name,
-                model_path=OFFICIAL_MODEL_ID,
-            )
-
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = RUNTIME_MPS_FALLBACK
+            configure_reproducibility(seed=RUNTIME_SEED, deterministic=RUNTIME_DETERMINISTIC)
+            if result_path == DEFAULT_RESULTS_FILE:
+                result_path = build_default_result_path(
+                    PROJECT_ROOT,
+                    policy_name,
+                    TASK_FILE,
+                    prefix="gui_eval",
+                )
             self._set_run_status("Starting evaluation...")
             self._append_log(f"Device: {self.device}")
             self._append_log(f"Render frame frequency: every {render_every_n_steps} step(s)")
@@ -639,22 +504,23 @@ class EvalGuiApp:
             self._append_log(f"Selected policy: {policy_name}")
             self._append_log(f"Loading model from {OFFICIAL_MODEL_ID}...")
             self._pump_ui()
-            model = POLICY_REGISTRY[policy_name]["build_model"]()
-            model.to(torch.device(self.device))
-            model.eval()
-
-            rename_map = build_rename_map(model)
-            self._append_log(f"Image rename map: {rename_map}")
-            self._set_run_status("Preparing preprocessors...")
-            self._pump_ui()
-            preprocessor, postprocessor = make_pre_post_processors(
-                policy_cfg=model.config,
-                pretrained_path=OFFICIAL_MODEL_ID,
-                preprocessor_overrides={
-                    "device_processor": {"device": self.device},
-                    "rename_observations_processor": {"rename_map": rename_map},
-                },
+            model, preprocessor, postprocessor, rename_map, router_metadata = load_policy_and_processors(
+                policy_name, self.device
             )
+
+            emit_event(
+                "run_start",
+                run_id,
+                mode="gui",
+                tasks_total=len(selected),
+                episodes_per_task=episodes,
+                device=self.device,
+                policy=policy_name,
+                model_path=OFFICIAL_MODEL_ID,
+                **router_metadata,
+            )
+
+            self._append_log(f"Image rename map: {rename_map}")
 
             results = {}
             for task_idx, task in enumerate(selected, start=1):
@@ -678,7 +544,16 @@ class EvalGuiApp:
                 )
                 results[task] = float(sr)
                 self._append_log(f"Done: {task} success_rate={sr:.3f}")
-                emit_event("task_end", run_id, task=task, success_rate=float(sr))
+                router_task_metadata = {}
+                if hasattr(model, "model") and hasattr(model.model, "last_router_decision"):
+                    router_task_metadata = dict(model.model.last_router_decision)
+                emit_event(
+                    "task_end",
+                    run_id,
+                    task=task,
+                    success_rate=float(sr),
+                    **router_task_metadata,
+                )
 
             if not self._first_frame_seen:
                 self._append_log("Preview: no frames received; env.render() may be unavailable in this run")
@@ -714,7 +589,8 @@ class EvalGuiApp:
 
 
 def main():
-    parse_args()
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        raise SystemExit("GUI mode requires a display server on Linux. Use CLI mode instead.")
     root = tk.Tk()
     app = EvalGuiApp(root)
     app._append_log("Ready. Select policy and tasks, then click Run Eval.")

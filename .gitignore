@@ -48,4 +48,4 @@ models/**/*.safetensors
 models/**/checkpoint*/
 
 # Vendored external package local build artifacts
-external/lerobot/src/lerobot.egg-info/
+external/
