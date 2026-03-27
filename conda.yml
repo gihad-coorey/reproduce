@@ -11,4 +11,8 @@ dependencies:
   - wheel
   - cmake=3.27
   - pip:
-    - -r requirements.txt
+    - imageio==2.37.3
+    - huggingface-hub==0.35.3
+    - libero==0.1.1
+    - lerobot==0.4.4
+    - num2words==0.5.14
