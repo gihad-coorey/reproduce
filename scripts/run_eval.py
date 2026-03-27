@@ -28,7 +28,6 @@ from scripts.common import (
 	build_default_result_path,
 	configure_reproducibility,
 	emit_event,
-	emit_log,
 	extract_preview_from_observation,
 	extract_render_frame,
 	load_policy_and_processors,
@@ -71,7 +70,7 @@ def _prompt_for_policy_choice(choices):
 			idx = int(selection)
 			if 1 <= idx <= len(choices):
 				return choices[idx - 1]
-		emit_log("WARNING", "invalid policy selection", selection=selection, min_index=1, max_index=len(choices))
+		continue
 
 
 def select_policy_runtime(args):
@@ -119,6 +118,7 @@ def run_task_with_frames(
 	render_every_n_steps,
 	run_id,
 	start_seed,
+	event_log_path,
 ):
 	task_frames_dir = Path(frames_dir) / run_id / task_name
 	task_frames_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +141,19 @@ def run_task_with_frames(
 			saved_frames += 1
 			frame_indices[episode_index] = frame_index + 1
 
+	def on_step(step: int, max_steps: int, _info, episode_index: int):
+		del _info
+		if step % 10 == 0:
+			emit_event(
+				"step_update",
+				run_id,
+				event_log_path=event_log_path,
+				task=task_name,
+				episode=episode_index + 1,
+				step=step,
+				max_steps=max_steps,
+			)
+
 	sr, build_s, eval_s = run_task_stepwise(
 		model=model,
 		preprocessor=preprocessor,
@@ -150,6 +163,7 @@ def run_task_with_frames(
 		start_seed=start_seed,
 		render_every_n_steps=render_every_n_steps,
 		on_frame=on_frame,
+		on_step=on_step,
 		on_episode_reset=on_episode_reset,
 	)
 
@@ -200,35 +214,20 @@ def parse_args():
 	parser.add_argument(
 		"--episodes-per-task",
 		type=int,
-		default=int(os.environ.get("LIBERO_EPISODES_PER_TASK", DEFAULT_EPISODES_PER_TASK)),
+		default=int(os.environ.get("EPISODES_PER_TASK", DEFAULT_EPISODES_PER_TASK)),
 		help="Episodes per task in normal mode.",
 	)
 	parser.add_argument(
 		"--n-envs",
 		type=int,
-		default=int(os.environ.get("LIBERO_N_ENVS", DEFAULT_N_ENVS_PER_TASK)),
+		default=int(os.environ.get("N_ENVS", DEFAULT_N_ENVS_PER_TASK)),
 		help="Number of vectorized envs for non-frame-dump runs.",
 	)
 	parser.add_argument(
 		"--task-file",
 		type=str,
-		default=os.environ.get("LIBERO_TASK_FILE", DEFAULT_TASK_FILE),
+		default=DEFAULT_TASK_FILE,
 		help="Task list JSON path (relative paths are resolved from project root).",
-	)
-	parser.add_argument(
-		"--results-file",
-		type=str,
-		default=os.environ.get("LIBERO_RESULTS_PATH", DEFAULT_RESULT_PATH),
-		help=(
-			"Results JSON output path (relative paths are resolved from project root). "
-			"If omitted, outputs are grouped under results/<policy>/<task_file_stem>/."
-		),
-	)
-	parser.add_argument(
-		"--frames-root",
-		type=str,
-		default=os.environ.get("LIBERO_FRAMES_ROOT", DEFAULT_FRAMES_ROOT),
-		help="Frame dump root directory when --save-frames is enabled.",
 	)
 	return parser.parse_args()
 
@@ -250,17 +249,18 @@ def main():
 	seed = int(RUNTIME_SEED)
 	deterministic = bool(RUNTIME_DETERMINISTIC)
 	task_file = resolve_project_path(args.task_file, project_root)
-	frames_root = resolve_project_path(args.frames_root, project_root)
+	frames_root = resolve_project_path(DEFAULT_FRAMES_ROOT, project_root)
 	n_envs_runtime = 1 if save_frames_enabled else int(args.n_envs)
 
 	run_id = str(uuid.uuid4())
 	configure_reproducibility(seed=seed, deterministic=deterministic)
 	_build_model, policy_label = select_policy_runtime(args)
 	model_path = OFFICIAL_MODEL_ID
-	if str(args.results_file).strip():
-		result_path = resolve_project_path(args.results_file, project_root)
+	if str(DEFAULT_RESULT_PATH).strip():
+		result_path = resolve_project_path(DEFAULT_RESULT_PATH, project_root)
 	else:
 		result_path = build_default_result_path(project_root, policy_label, task_file, prefix="official_eval")
+	event_log_path = result_path.with_suffix(".jsonl")
 	model, preprocessor, postprocessor, rename_map, router_metadata = load_policy_and_processors(policy_label, device)
 
 	os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = RUNTIME_MPS_FALLBACK
@@ -272,17 +272,9 @@ def main():
 	if args.smoke:
 		tasks = tasks[:1]
 		episodes_per_task = DEFAULT_SMOKE_EPISODES
-		emit_log(
-			"WARNING",
-			"smoke mode enabled",
-			tasks_total=len(tasks),
-			episodes_per_task=episodes_per_task,
-		)
 	else:
 		episodes_per_task = int(args.episodes_per_task)
 
-	slurm_job_id = os.environ.get("SLURM_JOB_ID", "")
-	slurm_array_id = os.environ.get("SLURM_ARRAY_TASK_ID", "")
 	mode = "smoke" if args.smoke else "full"
 	base_event_fields = {
 		"mode": mode,
@@ -292,17 +284,14 @@ def main():
 		"n_envs": n_envs_runtime,
 		"episodes_per_task": episodes_per_task,
 		"seed": seed,
-		"deterministic": deterministic,
-		"slurm_job_id": slurm_job_id,
-		"slurm_array_task_id": slurm_array_id,
 	}
 
 	emit_event(
 		"run_start",
 		run_id,
+		event_log_path=event_log_path,
 		**base_event_fields,
 		tasks_total=len(tasks),
-		use_async_envs=False,
 		mps_fallback=RUNTIME_MPS_FALLBACK,
 		save_frames=save_frames_enabled,
 		render_every_n_steps=int(render_every_n_steps),
@@ -312,44 +301,14 @@ def main():
 		**router_metadata,
 	)
 
-	emit_log("INFO", "policy selected", run_id=run_id, policy=policy_label)
-	emit_log("INFO", "checkpoint selected", run_id=run_id, checkpoint=model_path)
-	emit_log("DEBUG", "image rename map", run_id=run_id, rename_map=rename_map)
-
 	results = {}
 	total_build_s = 0.0
 	total_eval_s = 0.0
 	total_saved_frames = 0
 	tasks_completed = 0
 
-	emit_log(
-		"INFO",
-		"eval config",
-		run_id=run_id,
-		device=device,
-		n_envs=n_envs_runtime,
-		use_async_envs=False,
-		mps_fallback=RUNTIME_MPS_FALLBACK,
-		seed=seed,
-		deterministic=deterministic,
-		episodes_per_task=episodes_per_task,
-		save_frames=save_frames_enabled,
-		render_every_n_steps=(render_every_n_steps if save_frames_enabled else "off"),
-	)
-	if save_frames_enabled:
-		emit_log("INFO", "frame dump directory", run_id=run_id, path=str(frames_root / run_id))
-
 	with torch.inference_mode():
 		for task_idx, task in enumerate(tqdm(tasks, desc="Tasks", disable=not sys.stdout.isatty()), start=1):
-			emit_log("INFO", "running task", run_id=run_id, task=task, task_index=task_idx, tasks_total=len(tasks))
-			emit_event(
-				"task_start",
-				run_id,
-				**base_event_fields,
-				task=task,
-				task_index=task_idx,
-				tasks_total=len(tasks),
-			)
 			if save_frames_enabled:
 				sr, build_s, eval_s, saved_frames = run_task_with_frames(
 					model,
@@ -361,6 +320,7 @@ def main():
 					render_every_n_steps=render_every_n_steps,
 					run_id=run_id,
 					start_seed=seed,
+					event_log_path=event_log_path,
 				)
 				total_saved_frames += saved_frames
 			else:
@@ -378,16 +338,6 @@ def main():
 			total_build_s += build_s
 			total_eval_s += eval_s
 			tasks_completed += 1
-			emit_log(
-				"INFO",
-				"task timing",
-				run_id=run_id,
-				task=task,
-				env_build_s=float(build_s),
-				eval_s=float(eval_s),
-			)
-			if save_frames_enabled:
-				emit_log("INFO", "task frame output", run_id=run_id, task=task, frames_saved=int(saved_frames))
 			results[task] = float(sr)
 			router_task_metadata = {}
 			if hasattr(model, "model") and hasattr(model.model, "last_router_decision"):
@@ -395,6 +345,7 @@ def main():
 			emit_event(
 				"task_end",
 				run_id,
+				event_log_path=event_log_path,
 				**base_event_fields,
 				task=task,
 				task_index=task_idx,
@@ -412,22 +363,12 @@ def main():
 	with result_path.open("w") as f:
 		json.dump(results, f, indent=2)
 
-	emit_log("INFO", "evaluation results", run_id=run_id, tasks=len(results))
-	for k, v in results.items():
-		emit_log("INFO", "task result", run_id=run_id, task=k, success_rate=float(v))
-	
 	# Print summary
 	mean_sr = np.mean(list(results.values()))
-	emit_log("INFO", "summary", run_id=run_id, mean_success_rate=float(mean_sr))
-	emit_log("INFO", "summary", run_id=run_id, total_env_build_s=float(total_build_s))
-	emit_log("INFO", "summary", run_id=run_id, total_eval_s=float(total_eval_s))
-	if save_frames_enabled:
-		emit_log("INFO", "summary", run_id=run_id, total_saved_frames=int(total_saved_frames))
-		emit_log("INFO", "summary", run_id=run_id, saved_frame_root=str(frames_root / run_id))
-	emit_log("INFO", "results file written", run_id=run_id, results_file=str(result_path))
 	emit_event(
 		"run_end",
 		run_id,
+		event_log_path=event_log_path,
 		**base_event_fields,
 		mean_success_rate=float(mean_sr),
 		tasks_completed=tasks_completed,
@@ -437,9 +378,6 @@ def main():
 		total_saved_frames=total_saved_frames,
 		results_file=str(result_path),
 	)
-	
-	if args.smoke:
-		emit_log("WARNING", "smoke run complete", run_id=run_id, hint="Run without --smoke for full evaluation")
 
 
 if __name__ == "__main__":

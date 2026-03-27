@@ -22,8 +22,8 @@ With current defaults:
 Cluster scaling examples:
 - Full task file with 10 episodes/task:
 	- `python scripts/run_eval.py --policy "HF" --task-file configs/tasks_libero_90.json --episodes-per-task 10`
-- Seeded run with explicit output artifact:
-	- `python scripts/run_eval.py --policy "HF" --results-file results/official_eval_custom.json`
+- Seeded run with explicit env count:
+	- `python scripts/run_eval.py --policy "HF" --n-envs 2`
 
 Full benchmark task configs:
 - `configs/tasks.json`: small local subset.
@@ -77,17 +77,17 @@ Remaining CLI controls:
 - `--episodes-per-task N`: normal-mode episodes per task.
 - `--n-envs N`: vectorized env count (non-frame mode).
 - `--task-file PATH`: task-list JSON path.
-- `--results-file PATH`: output results JSON path (optional override).
-- `--frames-root PATH`: frame dump root (when `--save-frames` is enabled).
 
 Default result grouping:
-- If `--results-file` is omitted, outputs are written to:
+- Outputs are written to:
 	- `results/<policy>/<task_file_stem>/official_eval_<job_id>_<array_id>.json`
 
-Environment variable equivalents:
-- `LIBERO_EPISODES_PER_TASK`, `LIBERO_N_ENVS`
-- `LIBERO_TASK_FILE`, `LIBERO_RESULTS_PATH`, `LIBERO_FRAMES_ROOT`
-- `PYTORCH_ENABLE_MPS_FALLBACK`
+Fixed runtime paths:
+- Result path override and frame root override are not exposed as CLI/environment inputs.
+- Paths are resolved from constants in `scripts/run_eval.py` and `scripts/common.py`.
+
+MPS fallback behavior:
+- `PYTORCH_ENABLE_MPS_FALLBACK` is pinned to `1` in shared runtime code.
 
 ## SLURM GPU Usage
 
@@ -100,8 +100,8 @@ Recommended full benchmark seed-array submission:
 - `sbatch scripts/submit_eval_slurm_array.sh`
 
 Common overrides:
-- `sbatch --export=CONDA_ENV_NAME=geng551x-gpu,EPISODES_PER_TASK=10,N_ENVS=4 scripts/submit_eval_slurm.sh`
-- `sbatch --array=0-9 --export=CONDA_ENV_NAME=geng551x-gpu scripts/submit_eval_slurm_array.sh`
+- `sbatch --export=EPISODES_PER_TASK=10,N_ENVS=4 scripts/submit_eval_slurm.sh`
+- `sbatch --array=0-9 scripts/submit_eval_slurm_array.sh`
 
 Array wrapper defaults:
 - Uses `configs/tasks_libero_90.json`
@@ -111,6 +111,7 @@ Array wrapper defaults:
 Wrapper behavior:
 - Activates conda env.
 - Forces explicit policy/task/episodes/env count.
+- Uses hardcoded conda env name `geng`.
 - Uses default grouped result outputs from `scripts/run_eval.py`:
 	- `results/<policy>/<task_file_stem>/official_eval_<job_id>_<array_id>.json`
 

@@ -30,7 +30,7 @@ DEFAULT_SMOKE_EPISODES = 1
 DEFAULT_N_ENVS_PER_TASK = 4
 RUNTIME_SEED = 0
 RUNTIME_DETERMINISTIC = True
-RUNTIME_MPS_FALLBACK = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+RUNTIME_MPS_FALLBACK = "1"
 
 
 def resolve_runtime_device() -> str:
@@ -52,21 +52,6 @@ def resolve_runtime_device() -> str:
     raise RuntimeError("CPU fallback not confirmed. Aborting run.")
 
 
-def emit_log(level: str, message: str, run_id: str | None = None, **data) -> None:
-    # Logfmt-like plaintext output with deterministic key order for easy parsing.
-    fields = [
-        f"ts={time.time():.6f}",
-        f"level={str(level).upper()}",
-        f"message={json.dumps(message)}",
-    ]
-    if run_id is not None:
-        fields.append(f"run_id={json.dumps(run_id)}")
-    for key in sorted(data):
-        value = data[key]
-        fields.append(f"{key}={json.dumps(value)}")
-    print(" ".join(fields), flush=True)
-
-
 def _to_json_serializable(value):
     if isinstance(value, Path):
         return str(value)
@@ -77,14 +62,6 @@ def _to_json_serializable(value):
             return value.item()
         return value.detach().cpu().tolist()
     return value
-
-
-def emit_jsonl(payload: dict[str, object]) -> None:
-    normalized = {key: _to_json_serializable(value) for key, value in payload.items()}
-    print(
-        json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str),
-        flush=True,
-    )
 
 
 def build_policy_registry() -> dict[str, dict[str, object]]:
@@ -127,22 +104,48 @@ def build_default_result_path(
     policy_name: str,
     task_file: Path,
     *,
-    prefix: str = "official_eval",
+    prefix: str = "eval",
 ) -> Path:
     group_dir = get_result_group_dir(project_root, policy_name, task_file)
-    job_id = os.environ.get("SLURM_JOB_ID", "local")
-    array_id = os.environ.get("SLURM_ARRAY_TASK_ID", "0")
-    return group_dir / f"{prefix}_{job_id}_{array_id}.json"
+    return group_dir / f"{prefix}.json"
 
 
-def emit_event(event: str, run_id: str, **data) -> None:
+def emit_event(
+    event: str,
+    run_id: str | None = None,
+    *,
+    event_log_path: str | Path | None = None,
+    **data,
+) -> None:
     payload = {
         "event": event,
-        "run_id": run_id,
         "ts": time.time(),
     }
+    if run_id is not None:
+        payload["run_id"] = run_id
     payload.update(data)
-    emit_jsonl(payload)
+    normalized = {key: _to_json_serializable(value) for key, value in payload.items()}
+    line = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+
+    if event_log_path is not None:
+        log_path = Path(event_log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+
+    summary = f"[{event}]"
+    if run_id is not None:
+        summary += f" run_id={run_id}"
+    if "task" in normalized:
+        summary += f" task={normalized['task']}"
+    if "success_rate" in normalized:
+        summary += f" success_rate={normalized['success_rate']}"
+    if "mean_success_rate" in normalized:
+        summary += f" mean_success_rate={normalized['mean_success_rate']}"
+    if "status" in normalized:
+        summary += f" status={normalized['status']}"
+    print(summary, flush=True)
 
 
 def parse_task_name(task_name: str) -> tuple[str, int]:
@@ -178,8 +181,7 @@ def extract_render_frame(env):
                 return frame
         if isinstance(frames, np.ndarray):
             return frames
-    except Exception as exc:
-        emit_log("WARNING", "failed to extract render frame", error=str(exc))
+    except Exception:
         return None
     return None
 
@@ -224,8 +226,7 @@ def extract_preview_from_observation(observation):
                 normalized = normalize_frame_uint8(frame)
                 if normalized is not None:
                     return normalized
-    except Exception as exc:
-        emit_log("WARNING", "failed to extract preview frame", error=str(exc))
+    except Exception:
         return None
     return None
 

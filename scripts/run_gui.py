@@ -35,7 +35,6 @@ from scripts.common import (
 )
 
 TASK_FILE = resolve_project_path(DEFAULT_TASK_FILE, PROJECT_ROOT)
-DEFAULT_FRAMES_DIR = Path("results/gui_frames")
 DEFAULT_POLICY_NAME = next(iter(POLICY_REGISTRY.keys()))
 DEFAULT_RESULTS_FILE = build_default_result_path(PROJECT_ROOT, DEFAULT_POLICY_NAME, TASK_FILE, prefix="gui_eval")
 
@@ -76,12 +75,12 @@ def run_single_task(
     fallback_preview_cb=None,
     status_cb=None,
     render_every_n_steps=1,
+    event_log_path=None,
 ):
     spinner_chars = "|/-\\"
 
     def on_episode_reset(env, observation, info, ep_index):
         ep_start = time.time()
-        emit_event("episode_start", run_id, task=task_name, episode=ep_index + 1, episodes_total=episodes)
         instruction = extract_task_instruction(env, info, task_name)
         progress_cb(f"Instruction: {instruction}")
         if render_frame_cb is not None:
@@ -119,6 +118,7 @@ def run_single_task(
         emit_event(
             "episode_end",
             run_id,
+            event_log_path=event_log_path,
             task=task_name,
             episode=ep_index + 1,
             steps=step,
@@ -154,8 +154,6 @@ class EvalGuiApp:
         self.policy_var = tk.StringVar(value="HF")
         self.episodes_var = tk.StringVar(value="1")
         self.render_every_var = tk.StringVar(value="10")
-        self.save_frames_var = tk.BooleanVar(value=False)
-        self.frames_dir_var = tk.StringVar(value=str(DEFAULT_FRAMES_DIR))
         self.results_var = tk.StringVar(value=str(DEFAULT_RESULTS_FILE))
         self._preview_photo = None
         self._latest_frame = None
@@ -165,8 +163,6 @@ class EvalGuiApp:
         self._fallback_preview_used = False
         self._last_ui_pump_time = 0.0
         self._last_preview_draw_time = 0.0
-        self._saved_frame_count = 0
-        self._frame_output_dir = None
         self.task_instruction_map = {}
 
         self._build_ui()
@@ -212,17 +208,6 @@ class EvalGuiApp:
         ttk.Entry(row, textvariable=self.render_every_var, width=8).pack(side=tk.LEFT, padx=(8, 16))
         ttk.Label(row, text="Results JSON path").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.results_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-
-        frames_row = ttk.Frame(frm)
-        frames_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Checkbutton(frames_row, text="Save rendered frames", variable=self.save_frames_var).pack(side=tk.LEFT)
-        ttk.Label(frames_row, text="Frames output dir").pack(side=tk.LEFT, padx=(16, 0))
-        ttk.Entry(frames_row, textvariable=self.frames_dir_var).pack(
-            side=tk.LEFT,
-            fill=tk.X,
-            expand=True,
-            padx=(8, 0),
-        )
 
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill=tk.X, pady=(0, 8))
@@ -387,24 +372,6 @@ class EvalGuiApp:
             self._append_log("Preview: using observation camera fallback (env.render() unavailable)")
         self._draw_preview_if_due()
 
-    def _save_frame_if_enabled(self, frame):
-        if self._frame_output_dir is None:
-            return
-        display = normalize_frame_uint8(frame)
-        if display is None:
-            return
-        frame_path = self._frame_output_dir / f"frame_{self._saved_frame_count:07d}.png"
-        Image.fromarray(display).save(frame_path)
-        self._saved_frame_count += 1
-
-    def _handle_rendered_frame(self, frame):
-        self._set_latest_frame(frame)
-        self._save_frame_if_enabled(frame)
-
-    def _handle_fallback_frame(self, frame):
-        self._set_latest_frame_fallback(frame)
-        self._save_frame_if_enabled(frame)
-
     def _update_preview(self):
         self._draw_preview_if_due()
         self.root.after(50, self._update_preview)
@@ -437,14 +404,7 @@ class EvalGuiApp:
             return None
 
         result_path = Path(self.results_var.get())
-        save_frames = bool(self.save_frames_var.get())
-        frames_dir = Path(self.frames_dir_var.get())
-
-        if save_frames and not str(frames_dir).strip():
-            messagebox.showerror("Bad frames path", "Frames output dir cannot be empty when saving frames.")
-            return None
-
-        return selected, episodes, render_every_n_steps, save_frames, frames_dir, policy_name, result_path
+        return selected, episodes, render_every_n_steps, policy_name, result_path
 
     def _start_run(self):
         if self._is_running:
@@ -453,7 +413,7 @@ class EvalGuiApp:
         if validated is None:
             return
 
-        selected, episodes, render_every_n_steps, save_frames, frames_dir, policy_name, result_path = validated
+        selected, episodes, render_every_n_steps, policy_name, result_path = validated
         self._is_running = True
         self.run_button.configure(state=tk.DISABLED)
         # On macOS, creating LIBERO/MuJoCo envs in a worker thread can trigger
@@ -464,8 +424,6 @@ class EvalGuiApp:
                 selected,
                 episodes,
                 render_every_n_steps,
-                save_frames,
-                frames_dir,
                 policy_name,
                 result_path,
             ),
@@ -476,12 +434,11 @@ class EvalGuiApp:
         selected,
         episodes,
         render_every_n_steps,
-        save_frames,
-        frames_dir,
         policy_name,
         result_path,
     ):
         run_id = str(uuid.uuid4())
+        event_log_path = result_path.with_suffix(".events.jsonl")
         try:
             os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = RUNTIME_MPS_FALLBACK
             configure_reproducibility(seed=RUNTIME_SEED, deterministic=RUNTIME_DETERMINISTIC)
@@ -492,15 +449,10 @@ class EvalGuiApp:
                     TASK_FILE,
                     prefix="gui_eval",
                 )
+            event_log_path = result_path.with_suffix(".jsonl")
             self._set_run_status("Starting evaluation...")
             self._append_log(f"Device: {self.device}")
             self._append_log(f"Render frame frequency: every {render_every_n_steps} step(s)")
-            self._frame_output_dir = None
-            self._saved_frame_count = 0
-            if save_frames:
-                self._frame_output_dir = frames_dir / run_id
-                self._frame_output_dir.mkdir(parents=True, exist_ok=True)
-                self._append_log(f"Saving rendered frames to {self._frame_output_dir}")
             self._append_log(f"Selected policy: {policy_name}")
             self._append_log(f"Loading model from {OFFICIAL_MODEL_ID}...")
             self._pump_ui()
@@ -511,6 +463,7 @@ class EvalGuiApp:
             emit_event(
                 "run_start",
                 run_id,
+                event_log_path=event_log_path,
                 mode="gui",
                 tasks_total=len(selected),
                 episodes_per_task=episodes,
@@ -526,7 +479,6 @@ class EvalGuiApp:
             for task_idx, task in enumerate(selected, start=1):
                 self._append_log(f"Running: {task}")
                 self._set_run_status(f"Running {task}...")
-                emit_event("task_start", run_id, task=task, task_index=task_idx, tasks_total=len(selected))
                 self._pump_ui()
                 sr = run_single_task(
                     model=model,
@@ -536,11 +488,12 @@ class EvalGuiApp:
                     episodes=episodes,
                     run_id=run_id,
                     progress_cb=self._append_log,
-                    render_frame_cb=self._handle_rendered_frame,
+                    render_frame_cb=self._set_latest_frame,
                     ui_pump_cb=self._pump_ui,
-                    fallback_preview_cb=self._handle_fallback_frame,
+                    fallback_preview_cb=self._set_latest_frame_fallback,
                     status_cb=self._set_run_status,
                     render_every_n_steps=render_every_n_steps,
+                    event_log_path=event_log_path,
                 )
                 results[task] = float(sr)
                 self._append_log(f"Done: {task} success_rate={sr:.3f}")
@@ -550,6 +503,7 @@ class EvalGuiApp:
                 emit_event(
                     "task_end",
                     run_id,
+                    event_log_path=event_log_path,
                     task=task,
                     success_rate=float(sr),
                     **router_task_metadata,
@@ -565,12 +519,11 @@ class EvalGuiApp:
             self._append_log("\n===== GUI EVAL RESULTS =====")
             for k, v in results.items():
                 self._append_log(f"{k}: {v:.3f}")
-            if save_frames:
-                self._append_log(f"Saved {self._saved_frame_count} frame(s) to {self._frame_output_dir}")
             self._append_log(f"Saved results to {result_path}")
             emit_event(
                 "run_end",
                 run_id,
+                event_log_path=event_log_path,
                 status="ok",
                 mean_success_rate=float(np.mean(list(results.values()))),
                 tasks_completed=len(results),
@@ -579,11 +532,10 @@ class EvalGuiApp:
 
         except Exception as exc:
             self._append_log(f"ERROR: {exc}")
-            emit_event("run_end", run_id, status="failed", error=str(exc))
+            emit_event("run_end", run_id, event_log_path=event_log_path, status="failed", error=str(exc))
             messagebox.showerror("Evaluation failed", str(exc))
             self._set_run_status("Failed")
         finally:
-            self._frame_output_dir = None
             self._is_running = False
             self.run_button.configure(state=tk.NORMAL)
 
