@@ -6,4 +6,6 @@
 
 - sbatch --export=ALL,POLICY_NAME=HF,TASK_FILE=configs/tasks.json ./scripts/eval_slurm.sh
 
-- python ./scripts/run_eval.py --policy HF --task-file ./configs tasks_libero_spatial.json --n-envs 2 --episodes-per-task 2
+- python ./scripts/run_eval.py --policy HF --task-file ./configs tasks_libero_spatial.json --n-envs 1 --episodes-per-task 2
+
+- kaya - S00percomputer!  
